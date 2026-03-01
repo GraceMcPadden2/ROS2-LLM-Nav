@@ -11,6 +11,7 @@ from rclpy.qos import qos_profile_sensor_data
 
 import numpy as np
 import json
+import math
 
 
 class ObjectDetector(Node):
@@ -21,7 +22,7 @@ class ObjectDetector(Node):
         self.bridge = CvBridge()
         self.model = YOLO("yolov8n.pt")
 
-        # Subscribe to RGB image
+        # Subscribe to RGB
         self.rgb_sub = self.create_subscription(
             Image,
             "/camera/image_raw",
@@ -29,39 +30,42 @@ class ObjectDetector(Node):
             qos_profile_sensor_data
         )
 
-        # Annotated image publisher
+        # Publishers
         self.annotated_pub = self.create_publisher(
             Image,
             "/detections/image_annotated",
             10
         )
 
-        # 2D pose estimate publisher
         self.object_pose_pub = self.create_publisher(
             PoseStamped,
             "/detected_objects",
             10
         )
 
-        # Dictionary publisher
         self.dict_pub = self.create_publisher(
             String,
             "/detected_objects_dict",
             10
         )
 
-        # Object dictionary
+        # Persistent memory
         self.object_map = {}
 
-        # Assume 90 degree horizontal field of view
+        # Horizontal camera FOV (approximate)
         self.horizontal_fov = np.deg2rad(90)
 
-        self.get_logger().info("RGB-only object detector ready")
+        # Object expiry time (seconds)
+        self.expiry_time = 20
 
+        self.get_logger().info("RGB object detector with memory ready")
+
+    # ==========================================================
+    # Main Callback
+    # ==========================================================
     def rgb_callback(self, msg):
 
         frame = self.bridge.imgmsg_to_cv2(msg, "bgr8")
-
         results = self.model(frame)
 
         # Publish annotated image
@@ -72,10 +76,10 @@ class ObjectDetector(Node):
         image_width = frame.shape[1]
         image_height = frame.shape[0]
 
-        # Clear dictionary each frame
-        self.object_map.clear()
+        current_time = self.get_clock().now().nanoseconds / 1e9
 
-        for i, box in enumerate(results[0].boxes):
+        # Process detections
+        for box in results[0].boxes:
 
             cls = int(box.cls[0])
             label = self.model.names[cls]
@@ -85,28 +89,45 @@ class ObjectDetector(Node):
             center_x = (x1 + x2) / 2
             box_height = (y2 - y1)
 
-            # Normalize horizontal position [-1, 1]
+            # Angle calculation
             normalized_x = (center_x - image_width / 2) / (image_width / 2)
-
-            # Convert to angle
             angle = normalized_x * (self.horizontal_fov / 2)
 
-            # Rough distance estimate from bounding box height
+            # Rough distance estimate
             distance_estimate = 1.0 / (box_height / image_height + 1e-6)
 
-            # Convert to robot-frame 2D estimate
-            x_pos = float(distance_estimate * np.cos(angle))
-            y_pos = float(distance_estimate * np.sin(angle))
+            x_pos = float(distance_estimate * math.cos(angle))
+            y_pos = float(distance_estimate * math.sin(angle))
 
-            object_id = f"{label}_{i+1}"
+            matched_id = None
 
-            # Store in dictionary
-            self.object_map[object_id] = {
+            # Try matching existing objects of same class
+            for obj_id, obj_data in self.object_map.items():
+
+                if not obj_id.startswith(label):
+                    continue
+
+                dx = obj_data["x"] - x_pos
+                dy = obj_data["y"] - y_pos
+                dist = math.sqrt(dx*dx + dy*dy)
+
+                if dist < 0.5:  # match threshold (meters approx)
+                    matched_id = obj_id
+                    break
+
+            # If no match, create new ID
+            if matched_id is None:
+                index = sum(1 for k in self.object_map if k.startswith(label)) + 1
+                matched_id = f"{label}_{index}"
+
+            # Update memory
+            self.object_map[matched_id] = {
                 "x": round(x_pos, 2),
-                "y": round(y_pos, 2)
+                "y": round(y_pos, 2),
+                "last_seen": current_time
             }
 
-            # Publish PoseStamped for RViz
+            # Publish pose for RViz
             pose = PoseStamped()
             pose.header.frame_id = "base_link"
             pose.header.stamp = self.get_clock().now().to_msg()
@@ -117,14 +138,28 @@ class ObjectDetector(Node):
 
             self.object_pose_pub.publish(pose)
 
-        # Publish dictionary as JSON
+        # Expire old objects
+        to_delete = []
+
+        for obj_id, obj_data in self.object_map.items():
+            if current_time - obj_data["last_seen"] > self.expiry_time:
+                to_delete.append(obj_id)
+
+        for obj_id in to_delete:
+            del self.object_map[obj_id]
+
+        # Publish dictionary without timestamps
+        clean_dict = {
+            k: {"x": v["x"], "y": v["y"]}
+            for k, v in self.object_map.items()
+        }
+
         json_msg = String()
-        json_msg.data = json.dumps(self.object_map)
+        json_msg.data = json.dumps(clean_dict)
         self.dict_pub.publish(json_msg)
 
-        # Log dictionary
-        if self.object_map:
-            self.get_logger().info(f"Objects: {self.object_map}")
+        if clean_dict:
+            self.get_logger().info(f"Memory: {clean_dict}")
 
 
 def main():
