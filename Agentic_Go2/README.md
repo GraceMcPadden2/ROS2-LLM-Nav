@@ -1,10 +1,23 @@
-# Agentic Go2
+Agent_move.py -- one command at a time
 
-Agentic Go2 is a senior design project focused on bridging **AI agent reasoning** with **real-world robot control** using a Unitree Go2 quadruped robot.
+Agent_multistep.py -- adds a planning step to convert request into steps, multiple commands at a time
 
-The goal of this project is to explore **embodied AI** — enabling language-driven agents to plan actions and execute them reliably on physical hardware through ROS2.
+Agent_multistep_speech.py -- multiple steps, robot says steps as its being done
 
-## Current Capabilites
-- planning and execution of multiple steps
-- Intregration with speech to text
+Set up:
+
+start docker container from docker folder
+
+create .env with OPENAI_API_KEY = "api-key-here"
+
+create venv and pip install requirements
+
+for speech only--
+in anouther terminal, connected to same docker container
+ros2 run speech_processor tts_node --ros-args \
+-p api_key:="api-key-here" \
+-p provider:="elevenlabs" \
+-p playback:="robot"
+
+run python3 Agent_move.py, Agent_multistep.py or Agent_multistep_speech.py
 
