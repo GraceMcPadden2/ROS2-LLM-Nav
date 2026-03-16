@@ -21,6 +21,7 @@ docker-compose up
 **2. Create a `.env` file in `Agentic_Go2/`**
 ```
 OPENAI_API_KEY="your-api-key-here"
+ROBOT_ENV = testing/live
 ```
 
 **3. Create a venv and install dependencies**
@@ -51,10 +52,6 @@ ros2 topic pub /tts std_msgs/msg/String "{data: 'Hello, I am Go2'}" --once
 
 ## Running
 
-```bash
-python3 Agent_move.py
-# or
+```
 python3 Agent_multistep.py
-# or
-python3 Agent_multistep_audio.py
 ```
