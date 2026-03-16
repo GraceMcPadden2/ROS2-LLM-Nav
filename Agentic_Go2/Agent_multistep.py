@@ -75,9 +75,11 @@ def recovery_stand() -> str:
 def look_for_object(label: str) -> str:
     """Check if a specific object is currently visible in the camera."""
     result = perception.find_object(label)
-    if result:
-        return f"Found '{label}' with confidence {result['score']:.2f} at bbox {result['bbox']}."
-    return f"'{label}' not detected."
+
+    if result is None:
+        return f"'{label}' not detected."
+
+    return f"Found '{label}' at x={result['x']}, y={result['y']}."
 
 tools = [walk, turn_in_place, sit, stretch, stand_up, stand_down, recovery_stand, look_for_object]
 TOOLS_BY_NAME = {t.name: t for t in tools}
