@@ -1,4 +1,6 @@
 import time
+import os
+
 from typing import Annotated, List, TypedDict, Optional, Literal, Dict, Any
 from pydantic import BaseModel, Field
 
@@ -12,37 +14,82 @@ from langgraph.graph.message import add_messages
 from dotenv import load_dotenv
 load_dotenv()
 
-from ros2_motion import RosMotionController
-motion = RosMotionController(cmd_vel_topic="/cmd_vel")
+TESTING = os.getenv("ROBOT_ENV", "testing") != "live"
+
+if TESTING:
+    print("Running in TESTING mode\n")
+    from ros2_mock_motion import MockMotionController
+    motion = MockMotionController()
+else:
+    from ros2_motion import RosMotionController
+    motion = RosMotionController(cmd_vel_topic="/cmd_vel")
+
 motion.start()
+perception = motion
 
 # Tools
 @tool
 def walk(duration_s: float = 1.0, speed_mps: float = 0.3) -> str:
-    """Make the robot walk for duration_s seconds at speed_mps m/s. Speed is postive when walking forwards, and negtive when walking backwards"""
+    """Make the robot walk"""
     motion.walk(duration_s=duration_s, speed_mps=speed_mps)
     return f"Walked for {duration_s}s at {speed_mps} m/s."
 
 @tool
 def turn_in_place(duration_s: float = 1.0, angular_z: float = 0.8) -> str:
-    """Turn in place for duration_s seconds with angular velocity angular_z rad/s. +CCW, -CW."""
+    """Turn in place"""
     motion.turn_in_place(duration_s=duration_s, angular_z=angular_z)
     direction = "CCW" if angular_z >= 0 else "CW"
     return f"Turned {direction} for {duration_s}s at {angular_z} rad/s."
 
-tools = [walk, turn_in_place]
+@tool
+def sit(duration_s: float = 3.0) -> str:
+    """Make the robot sit down for duration_s seconds, then stand back up."""
+    motion.sit(duration_s=duration_s)
+    return f"Sat for {duration_s}s."
+
+@tool
+def stretch(duration_s: float = 3.0) -> str:
+    """Make the robot stretch for duration_s seconds."""
+    motion.stretch(duration_s=duration_s)
+    return f"Stretched for {duration_s}s."
+
+@tool
+def stand_up() -> str:
+    """Make the robot stand up."""
+    motion.stand_up()
+    return "Stood up."
+
+@tool
+def stand_down() -> str:
+    """Make the lay down."""
+    motion.stand_down()
+    return "Stood down."
+
+@tool
+def recovery_stand() -> str:
+    """Make the robot recover to a standing position from any pose."""
+    motion.recovery_stand()
+    return "Recovery stand complete."
+
+@tool
+def look_for_object(label: str) -> str:
+    """Check if a specific object is currently visible in the camera."""
+    result = perception.find_object(label)
+    if result:
+        return f"Found '{label}' with confidence {result['score']:.2f} at bbox {result['bbox']}."
+    return f"'{label}' not detected."
+
+tools = [walk, turn_in_place, sit, stretch, stand_up, stand_down, recovery_stand, look_for_object]
 TOOLS_BY_NAME = {t.name: t for t in tools}
 
 # Planner schema
 class Step(BaseModel):
-    action: Literal["walk", "turn_in_place"]
-    duration_s: float = Field(default=1.0, ge=0.0)
-    speed_mps: Optional[float] = None
-    angular_z: Optional[float] = None
+    action: Literal["walk", "turn_in_place", "sit", "stretch", "stand_up", "stand_down", "recovery_stand", "look_for_object"]
+    duration_s: Optional[float] = Field(default=None, ge=0.0)
+    label: Optional[str] = Field(default=None)
 
 class Plan(BaseModel):
     steps: List[Step]
-
 
 # State
 class AgentState(TypedDict):
@@ -72,19 +119,28 @@ def print_tool_result(name: str, result: str):
 # Nodes
 def plan_node(state: AgentState):
     system = SystemMessage(content=(
-        "You are a motion planning assistant for a ROS2-controlled robot.\n"
-        "Convert the user's request into a short sequence of steps using ONLY:\n"
+        "You are a motion planner for a ROS2 robot.\n"
+        "Return a plan using ONLY these actions:\n"
         "- walk(duration_s, speed_mps)\n"
         "- turn_in_place(duration_s, angular_z)\n"
-        "Use angular_z < 0 for right turn, > 0 for left turn.\n"
-        "Prefer 0.3 m/s and 0.8 rad/s if user doesn't specify.\n"
+        "- sit(duration_s)\n"
+        "- stretch(duration_s)\n"
+        "- stand_up()\n"
+        "- stand_down()\n"
+        "- recovery_stand()\n"
+        "- look_for_object(label) — check if an object is visible before acting\n\n"
+        "Rules:\n"
+        "1. Only include actions needed to satisfy the request.\n"
+        "2. Do not invent actions.\n"
+        "3. If the user does not specify parameters, use sensible defaults.\n"
+        "4. Keep the plan short.\n"
+        "5. For conversation-only requests like 'hi', return an empty plan.\n"
     ))
     plan = planner_llm.invoke([system] + state["messages"])
-
+    print_plan(plan)
     return {"plan": plan, "step_idx": 0}
 
 def execute_step_node(state: AgentState):
-    """Ask the model to execute exactly one step by calling the right tool."""
     assert state["plan"] is not None
     idx = state["step_idx"]
 
@@ -99,10 +155,8 @@ def execute_step_node(state: AgentState):
         "Call exactly one tool corresponding to the step. Do not add extra steps."
     ))
     user = HumanMessage(content=f"Execute step: {step.model_dump()}")
-
     response = executor_llm.invoke([system, user])
 
-    # Print what the model requested (tool calls) if present
     tcalls = getattr(response, "tool_calls", None) or []
     if tcalls:
         for tc in tcalls:
@@ -111,7 +165,6 @@ def execute_step_node(state: AgentState):
     return {"messages": [response]}
 
 def run_tools_node(state: AgentState):
-    """Execute the tool calls from the last assistant message, printing calls + results."""
     if not state["messages"]:
         return {}
 
@@ -134,13 +187,11 @@ def run_tools_node(state: AgentState):
             new_msgs.append(ToolMessage(content=result, tool_call_id=call_id))
             continue
 
-        # Actually run the tool
         try:
             result = tool_obj.invoke(args)
         except Exception as e:
             result = f"ERROR running {name}: {e}"
 
-        # Print + append ToolMessage (this is what lets the model continue)
         print_tool_result(name, str(result))
         new_msgs.append(ToolMessage(content=str(result), tool_call_id=call_id))
 
@@ -167,16 +218,12 @@ builder = StateGraph(AgentState)
 
 builder.add_node("plan", plan_node)
 builder.add_node("exec_step", execute_step_node)
-builder.add_node("tools", run_tools_node) 
+builder.add_node("tools", run_tools_node)
 builder.add_node("advance", advance_node)
 
 builder.set_entry_point("plan")
 
-builder.add_conditional_edges(
-    "plan",
-    lambda s: "exec_step",
-    {"exec_step": "exec_step"},
-)
+builder.add_edge("plan", "exec_step")
 
 builder.add_conditional_edges(
     "exec_step",
@@ -194,18 +241,19 @@ builder.add_edge("advance", "exec_step")
 
 graph = builder.compile()
 
-
-# Run loop (prints incremental messages too)
+# Run loop
 if __name__ == "__main__":
+    if TESTING:
+        print("TESTING mode — no robot commands will be sent.")
     print("Planner+Executor ready! Type 'exit' to quit.\n")
     state: AgentState = {"messages": [], "plan": None, "step_idx": 0}
+
     while True:
         user_input = input("You: ")
         if user_input.lower() in ["exit", "quit", "q"]:
             print("Goodbye!")
             break
 
-        # Track how many messages existed pre-run so we can print only the new ones
         before = len(state["messages"])
 
         state["messages"].append(HumanMessage(content=user_input))
@@ -214,10 +262,8 @@ if __name__ == "__main__":
 
         state = graph.invoke(state)
 
-        # Print any final assistant message content (if it produced one)
         new_messages = state["messages"][before:]
         for m in new_messages:
-            # Skip ToolMessages (we already printed tool results)
             if isinstance(m, ToolMessage):
                 continue
             content = getattr(m, "content", None)
